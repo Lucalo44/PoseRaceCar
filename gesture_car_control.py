@@ -38,10 +38,15 @@ TRAIN mode (the mode the script starts in):
 
 RUN mode (press 'm' to toggle into it):
     The classifier continuously predicts your pose from the live feed and,
-    if a Double Motor is connected, drives it accordingly. If the
-    classifier isn't confident enough about a prediction, predicts idle,
-    or loses track of your pose entirely for a few frames, the motor stops
-    as a fail-safe.
+    if a Double Motor is connected, drives it accordingly. Predictions are
+    smoothed in two ways so brief noise doesn't jerk the motor around:
+    a rolling majority vote over the last --smoothing frames, and a short
+    grace period (--idle-grace) that lets a momentary dip in confidence
+    -- the kind that naturally happens for a frame or two while you're
+    physically moving from one gesture to another -- coast on the last
+    confident command instead of instantly falling back to idle. Only
+    once low confidence (or a lost pose) persists past that grace period
+    does the motor actually stop.
 
 Keyboard controls
 ------------------
@@ -126,6 +131,14 @@ MOTOR_COMMAND_FOR_LABEL = {
 # frames, drop any buffered predictions rather than keep acting on a
 # stale, possibly no-longer-true gesture.
 POSE_LOST_FRAMES_BEFORE_RESET = 5
+
+# While physically moving from one real gesture to another, the pose
+# briefly looks ambiguous and the windowed vote can dip below --confidence
+# for a frame or two even though nothing is actually wrong. Requiring that
+# dip to persist for this many consecutive frames before falling back to
+# idle keeps that momentary transition from instantly overriding whatever
+# gesture was last confidently recognized.
+UNCERTAIN_FRAMES_BEFORE_IDLE = 4
 
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
@@ -406,6 +419,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Number of recent frames to majority-vote over before sending a motor command",
     )
     parser.add_argument(
+        "--idle-grace",
+        dest="idle_grace",
+        type=int,
+        default=UNCERTAIN_FRAMES_BEFORE_IDLE,
+        help=(
+            "Consecutive low-confidence frames required before falling back to idle "
+            "(higher = smoother through gesture transitions, but slower to actually stop)"
+        ),
+    )
+    parser.add_argument(
         "--min-samples",
         dest="min_samples",
         type=int,
@@ -456,6 +479,8 @@ def main() -> int:
     mode = "TRAIN"
     smoothing: deque = deque(maxlen=max(1, args.smoothing))
     missing_pose_frames = 0
+    uncertain_frames = 0
+    last_confident_label = "idle"
     start_time = time.time()
 
     try:
@@ -494,12 +519,27 @@ def main() -> int:
                 if missing_pose_frames >= POSE_LOST_FRAMES_BEFORE_RESET:
                     smoothing.clear()
 
-            smoothed_label = None
             if smoothing:
                 label, votes = Counter(smoothing).most_common(1)[0]
-                smoothed_label = label if votes / len(smoothing) >= args.confidence else "idle"
+                if votes / len(smoothing) >= args.confidence:
+                    # Confident majority: adopt it immediately and reset
+                    # the ambiguity counter.
+                    last_confident_label = label
+                    uncertain_frames = 0
+                else:
+                    # Ambiguous window -- likely just a brief transition
+                    # between two real gestures. Keep coasting on the last
+                    # confident label until the ambiguity has persisted for
+                    # --idle-grace frames in a row, rather than instantly
+                    # snapping to idle.
+                    uncertain_frames += 1
+                    if uncertain_frames >= args.idle_grace:
+                        last_confident_label = "idle"
             elif missing_pose_frames >= POSE_LOST_FRAMES_BEFORE_RESET:
-                smoothed_label = "idle"
+                last_confident_label = "idle"
+                uncertain_frames = 0
+
+            smoothed_label = last_confident_label if (smoothing or missing_pose_frames >= POSE_LOST_FRAMES_BEFORE_RESET) else None
 
             if mode == "RUN":
                 if smoothed_label is not None:
@@ -530,6 +570,8 @@ def main() -> int:
             elif key == ord("m"):
                 mode = "RUN" if mode == "TRAIN" else "TRAIN"
                 smoothing.clear()
+                uncertain_frames = 0
+                last_confident_label = "idle"
                 if mode == "TRAIN":
                     motor.send("stop")
                 else:
