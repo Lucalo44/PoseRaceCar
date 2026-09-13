@@ -12,15 +12,24 @@ How it works
 A MediaPipe Pose Landmarker tracks your upper-body pose from the webcam.
 A lightweight k-nearest-neighbors classifier -- trained live, right in this
 script, with no external ML framework required -- maps your pose to one of
-five classes:
+eight classes:
 
-    idle   stop   go   left   right
+    idle   stop   go   left   right   back_left   back_right   reverse
 
 "idle" is a deliberate catch-all: it's your natural resting posture (arms
-relaxed, not making any of the other four gestures), and it exists so the
+relaxed, not making any of the other gestures), and it exists so the
 classifier has somewhere to put "no command" instead of being forced to
-misread an incidental pose as stop/go/left/right. Predicting idle (like
-predicting stop) simply keeps the motor stopped.
+misread an incidental pose as one of the real commands. Predicting idle
+(like predicting stop) simply keeps the motor stopped.
+
+The Double Motor is tank-drive (independent left/right wheels), so on top
+of the basic forward/turn commands there are three reverse maneuvers:
+
+    reverse      both wheels backward together (straight reverse)
+    back_left    only the LEFT wheel reverses, right wheel holds still --
+                 pivots the car backward around its stationary right wheel
+    back_right   only the RIGHT wheel reverses, left wheel holds still --
+                 the mirror image of back_left
 
 Two modes
 ---------
@@ -28,7 +37,8 @@ TRAIN mode (the mode the script starts in):
     Strike a pose and press the matching number key to record a labeled
     training sample from the current frame:
 
-        0 = idle     1 = stop     2 = go     3 = left     4 = right
+        0 = idle    1 = stop    2 = go       3 = left     4 = right
+        5 = back_left           6 = back_right           7 = reverse
 
     Collect a few dozen samples per class, ideally from a few different
     distances/angles, for a more robust classifier. Don't skip idle --
@@ -51,6 +61,7 @@ RUN mode (press 'm' to toggle into it):
 Keyboard controls
 ------------------
     0 / 1 / 2 / 3 / 4   Record a training sample for idle / stop / go / left / right
+    5 / 6 / 7       Record a training sample for back_left / back_right / reverse
     m               Toggle TRAIN <-> RUN mode
     x               Connect to a Double Motor over Bluetooth (background)
     v               Disconnect from the Double Motor
@@ -107,24 +118,31 @@ except ImportError:
 # Configuration
 # --------------------------------------------------------------------------
 
-CLASSES = ["idle", "stop", "go", "left", "right"]
+CLASSES = ["idle", "stop", "go", "left", "right", "back_left", "back_right", "reverse"]
 KEY_TO_CLASS = {
     ord("0"): "idle",
     ord("1"): "stop",
     ord("2"): "go",
     ord("3"): "left",
     ord("4"): "right",
+    ord("5"): "back_left",
+    ord("6"): "back_right",
+    ord("7"): "reverse",
 }
 
 # "idle" isn't a motor command -- it's the classifier's catch-all for "no
 # gesture is being made right now". Both it and an unconfident/lost-pose
-# prediction should simply keep the motor stopped.
+# prediction should simply keep the motor stopped. Every other label maps
+# to itself; MotorController.send() knows how to drive each one.
 MOTOR_COMMAND_FOR_LABEL = {
     "idle": "stop",
     "stop": "stop",
     "go": "go",
     "left": "left",
     "right": "right",
+    "back_left": "back_left",
+    "back_right": "back_right",
+    "reverse": "reverse",
 }
 
 # If the pose is lost (no person detected) for this many consecutive
@@ -166,8 +184,8 @@ MODEL_URL = (
 #
 #     CARD_COLOR = le.LEGO_COLOR_RED
 #
-CARD_COLOR = None
-CARD_SERIAL = None
+CARD_COLOR = le.LEGO_COLOR_ORANGE
+CARD_SERIAL = "0994"
 
 # Upper-body landmarks used as classifier features. Legs are frequently out
 # of frame at a desk/table setup and add nothing for these four motions.
@@ -342,6 +360,32 @@ class MotorController:
             self.status = "disconnected"
             self._last_command = None
 
+    def _apply(self, label: str) -> None:
+        """Issue the underlying motor call for a resolved motor command
+        (i.e. one already passed through MOTOR_COMMAND_FOR_LABEL). Split out
+        from send() so set_speed() can re-issue the current command at a
+        new speed without going through the repeat-command dedupe below.
+        """
+        if label == "stop":
+            self.motor.movement_stop(blocking=False)
+        elif label == "go":
+            self.motor.movement_move(direction=le.MOVEMENT_DIRECTION_FORWARD, speed=self.speed, blocking=False)
+        elif label == "left":
+            self.motor.movement_move(direction=le.MOVEMENT_DIRECTION_LEFT, speed=self.speed, blocking=False)
+        elif label == "right":
+            self.motor.movement_move(direction=le.MOVEMENT_DIRECTION_RIGHT, speed=self.speed, blocking=False)
+        elif label == "reverse":
+            # Full reverse: both wheels backward together.
+            self.motor.movement_move_tank(-self.speed, -self.speed, blocking=False)
+        elif label == "back_left":
+            # Only the left wheel reverses; the right wheel holds still, so
+            # the car pivots backward around its stationary right wheel.
+            self.motor.movement_move_tank(-self.speed, 0, blocking=False)
+        elif label == "back_right":
+            # Mirror of back_left: only the right wheel reverses, pivoting
+            # backward around the stationary left wheel.
+            self.motor.movement_move_tank(0, -self.speed, blocking=False)
+
     def send(self, label: str) -> None:
         """Issue a motor command for the given gesture label. Repeated
         identical labels are ignored so continuous predictions don't flood
@@ -353,14 +397,7 @@ class MotorController:
             return
         self._last_command = label
         try:
-            if label == "stop":
-                self.motor.movement_stop(blocking=False)
-            elif label == "go":
-                self.motor.movement_move(direction=le.MOVEMENT_DIRECTION_FORWARD, speed=self.speed, blocking=False)
-            elif label == "left":
-                self.motor.movement_move(direction=le.MOVEMENT_DIRECTION_LEFT, speed=self.speed, blocking=False)
-            elif label == "right":
-                self.motor.movement_move(direction=le.MOVEMENT_DIRECTION_RIGHT, speed=self.speed, blocking=False)
+            self._apply(label)
         except Exception as exc:  # noqa: BLE001
             self.status = f"error: {exc}"
 
@@ -368,7 +405,11 @@ class MotorController:
         self.speed = max(0, min(100, speed))
         if self.status == "connected" and self.motor is not None and self._last_command not in (None, "stop"):
             try:
-                self.motor.movement_set_speed(self.speed, blocking=False)
+                # Re-issue the currently active command at the new speed.
+                # (movement_set_speed() only affects movement_move-style
+                # commands, not an in-progress movement_move_tank(), so we
+                # resend explicitly to cover every command type.)
+                self._apply(self._last_command)
             except Exception:
                 pass
 
@@ -398,7 +439,8 @@ def draw_overlay(frame, *, mode, classifier: GestureClassifier, smoothed_label, 
     put(f"Mode: {mode}   (m: toggle)", mode_color)
 
     counts = classifier.counts()
-    put("Samples  " + "  ".join(f"{cls}:{counts[cls]}" for cls in CLASSES))
+    put("Samples  " + "  ".join(f"{cls}:{counts[cls]}" for cls in CLASSES[:5]))
+    put("         " + "  ".join(f"{cls}:{counts[cls]}" for cls in CLASSES[5:]))
 
     if smoothed_label is not None:
         put(f"Prediction: {smoothed_label}  (last frame vote {raw_confidence * 100:.0f}%, k={classifier.k})", (0, 255, 255))
@@ -407,8 +449,9 @@ def draw_overlay(frame, *, mode, classifier: GestureClassifier, smoothed_label, 
 
     put(f"Motor: {motor.status}   speed={motor.speed}%")
     put("-" * 46, (120, 120, 120))
-    put("0/1/2/3/4: label idle/stop/go/left/right    s: save    l: load    c: clear")
-    put("x: connect motor   v: disconnect   +/-: speed   [ / ]: k   q: quit")
+    put("0/1/2/3/4: idle/stop/go/left/right   5/6/7: back-left/back-right/reverse")
+    put("s: save   l: load   c: clear   x: connect   v: disconnect")
+    put("+/-: speed   [ / ]: k   q: quit")
 
 
 # --------------------------------------------------------------------------
