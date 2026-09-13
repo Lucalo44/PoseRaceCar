@@ -145,6 +145,30 @@ MODEL_URL = (
     "pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
 )
 
+# --------------------------------------------------------------------------
+# LEGO Connection Card filter
+# --------------------------------------------------------------------------
+# By default this script connects to the first Double Motor it finds over
+# Bluetooth. If you have more than one LEGO device nearby, edit the values
+# below to target one specific Double Motor by the Connection Card plugged
+# into it.
+#
+#   CARD_COLOR: one of legoeducation's le.LEGO_COLOR_* constants, e.g.:
+#       le.LEGO_COLOR_RED     le.LEGO_COLOR_BLUE   le.LEGO_COLOR_GREEN
+#       le.LEGO_COLOR_YELLOW  le.LEGO_COLOR_TEAL   le.LEGO_COLOR_PURPLE
+#       le.LEGO_COLOR_WHITE   le.LEGO_COLOR_MAGENTA le.LEGO_COLOR_ORANGE
+#       le.LEGO_COLOR_AZURE
+#   CARD_SERIAL: the card's printed serial number as a string, e.g. "0049".
+#                Useful to disambiguate two cards of the same color.
+#
+# Leave either one as None to not filter on it. Example -- to only connect
+# to the Double Motor with a red Connection Card:
+#
+#     CARD_COLOR = le.LEGO_COLOR_RED
+#
+CARD_COLOR = None
+CARD_SERIAL = None
+
 # Upper-body landmarks used as classifier features. Legs are frequently out
 # of frame at a desk/table setup and add nothing for these four motions.
 FEATURE_LANDMARKS = [
@@ -293,7 +317,7 @@ class MotorController:
     def _connect(self) -> None:
         try:
             self.motor = le.DoubleMotor()
-            self.motor.connect()
+            self.motor.connect(card_color=CARD_COLOR, card_serial=CARD_SERIAL)
             if self.motor.connected:
                 self.status = "connected"
                 self._last_command = None
@@ -595,7 +619,10 @@ def main() -> int:
                 classifier.clear()
                 print("Cleared in-memory training samples (dataset on disk is untouched until you press 's').")
             elif key == ord("x"):
-                print("Connecting to Double Motor...")
+                if CARD_COLOR is not None or CARD_SERIAL is not None:
+                    print(f"Connecting to Double Motor (card_color={CARD_COLOR}, card_serial={CARD_SERIAL})...")
+                else:
+                    print("Connecting to Double Motor (no Connection Card filter set -- first one found)...")
                 motor.connect_async()
             elif key == ord("v"):
                 print("Disconnecting from Double Motor...")
