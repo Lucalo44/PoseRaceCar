@@ -12,9 +12,15 @@ How it works
 A MediaPipe Pose Landmarker tracks your upper-body pose from the webcam.
 A lightweight k-nearest-neighbors classifier -- trained live, right in this
 script, with no external ML framework required -- maps your pose to one of
-four motions:
+five classes:
 
-    stop   go   left   right
+    idle   stop   go   left   right
+
+"idle" is a deliberate catch-all: it's your natural resting posture (arms
+relaxed, not making any of the other four gestures), and it exists so the
+classifier has somewhere to put "no command" instead of being forced to
+misread an incidental pose as stop/go/left/right. Predicting idle (like
+predicting stop) simply keeps the motor stopped.
 
 Two modes
 ---------
@@ -22,21 +28,24 @@ TRAIN mode (the mode the script starts in):
     Strike a pose and press the matching number key to record a labeled
     training sample from the current frame:
 
-        1 = stop     2 = go     3 = left     4 = right
+        0 = idle     1 = stop     2 = go     3 = left     4 = right
 
     Collect a few dozen samples per class, ideally from a few different
-    distances/angles, for a more robust classifier. The motor is always
-    held stopped while in TRAIN mode.
+    distances/angles, for a more robust classifier. Don't skip idle --
+    record it while standing naturally, shifting your weight, adjusting
+    your posture, etc., so the classifier learns what "not gesturing"
+    looks like. The motor is always held stopped while in TRAIN mode.
 
 RUN mode (press 'm' to toggle into it):
     The classifier continuously predicts your pose from the live feed and,
     if a Double Motor is connected, drives it accordingly. If the
-    classifier isn't confident enough about a prediction, the motor stops
+    classifier isn't confident enough about a prediction, predicts idle,
+    or loses track of your pose entirely for a few frames, the motor stops
     as a fail-safe.
 
 Keyboard controls
 ------------------
-    1 / 2 / 3 / 4   Record a training sample for stop / go / left / right
+    0 / 1 / 2 / 3 / 4   Record a training sample for idle / stop / go / left / right
     m               Toggle TRAIN <-> RUN mode
     x               Connect to a Double Motor over Bluetooth (background)
     v               Disconnect from the Double Motor
@@ -93,8 +102,30 @@ except ImportError:
 # Configuration
 # --------------------------------------------------------------------------
 
-CLASSES = ["stop", "go", "left", "right"]
-KEY_TO_CLASS = {ord("1"): "stop", ord("2"): "go", ord("3"): "left", ord("4"): "right"}
+CLASSES = ["idle", "stop", "go", "left", "right"]
+KEY_TO_CLASS = {
+    ord("0"): "idle",
+    ord("1"): "stop",
+    ord("2"): "go",
+    ord("3"): "left",
+    ord("4"): "right",
+}
+
+# "idle" isn't a motor command -- it's the classifier's catch-all for "no
+# gesture is being made right now". Both it and an unconfident/lost-pose
+# prediction should simply keep the motor stopped.
+MOTOR_COMMAND_FOR_LABEL = {
+    "idle": "stop",
+    "stop": "stop",
+    "go": "go",
+    "left": "left",
+    "right": "right",
+}
+
+# If the pose is lost (no person detected) for this many consecutive
+# frames, drop any buffered predictions rather than keep acting on a
+# stale, possibly no-longer-true gesture.
+POSE_LOST_FRAMES_BEFORE_RESET = 5
 
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
@@ -339,7 +370,7 @@ def draw_overlay(frame, *, mode, classifier: GestureClassifier, smoothed_label, 
 
     put(f"Motor: {motor.status}   speed={motor.speed}%")
     put("-" * 46, (120, 120, 120))
-    put("1/2/3/4: label stop/go/left/right    s: save    l: load    c: clear")
+    put("0/1/2/3/4: label idle/stop/go/left/right    s: save    l: load    c: clear")
     put("x: connect motor   v: disconnect   +/-: speed   [ / ]: k   q: quit")
 
 
@@ -424,6 +455,7 @@ def main() -> int:
 
     mode = "TRAIN"
     smoothing: deque = deque(maxlen=max(1, args.smoothing))
+    missing_pose_frames = 0
     start_time = time.time()
 
     try:
@@ -449,18 +481,29 @@ def main() -> int:
 
             raw_prediction, raw_confidence = (None, 0.0)
             if feat is not None:
+                missing_pose_frames = 0
                 raw_prediction, raw_confidence = classifier.predict(feat)
                 if raw_prediction is not None:
                     smoothing.append(raw_prediction)
+            else:
+                # No pose detected this frame (person out of view, tracking
+                # briefly lost, etc). Don't let old buffered votes keep
+                # driving the motor indefinitely -- drop them after a short
+                # grace period.
+                missing_pose_frames += 1
+                if missing_pose_frames >= POSE_LOST_FRAMES_BEFORE_RESET:
+                    smoothing.clear()
 
             smoothed_label = None
             if smoothing:
                 label, votes = Counter(smoothing).most_common(1)[0]
-                smoothed_label = label if votes / len(smoothing) >= args.confidence else "stop"
+                smoothed_label = label if votes / len(smoothing) >= args.confidence else "idle"
+            elif missing_pose_frames >= POSE_LOST_FRAMES_BEFORE_RESET:
+                smoothed_label = "idle"
 
             if mode == "RUN":
                 if smoothed_label is not None:
-                    motor.send(smoothed_label)
+                    motor.send(MOTOR_COMMAND_FOR_LABEL.get(smoothed_label, "stop"))
             else:
                 motor.send("stop")  # fail-safe: never drive while training
 
