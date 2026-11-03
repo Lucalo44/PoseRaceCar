@@ -3,8 +3,7 @@
 gesture_car_control.py
 =======================
 
-Controls a LEGO Education Double Motor (the "Move Motor" used with SPIKE
-Prime / Robot Inventor) using body-pose gestures captured from a live
+Controls a LEGO Education Double Motor using body-pose gestures captured from a live
 webcam feed.
 
 How it works
